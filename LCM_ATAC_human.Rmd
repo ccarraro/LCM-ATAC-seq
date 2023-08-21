@@ -1,0 +1,1060 @@
+---
+title: "LCM_ATAC_human_revision"
+author: "C Carraro"
+date: "06/07/23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install packages
+
+```{r}
+list.of.bioc.packages<- c("Rsamtools",
+                          "GenomicAlignments",
+                          "rtracklayer",
+                          "ChIPseeker",
+                          "DBI",
+                          "TxDb.Hsapiens.UCSC.hg38.knownGene",
+                          "org.Mm.eg.db",
+                          "DESeq2",
+                          "org.Hs.eg.db",
+                          "vsn",
+                          "tximport",
+                          "rhdf5",
+                          "clusterProfiler",
+                          "DOSE",
+                          "GSEABase",
+                          "RColorBrewer",
+                          "ComplexHeatmap",
+                          "pheatmap",
+                          "genefilter",
+                          "biomaRt",
+                          "limma",
+                          "sva",
+                          "IHW",
+                          "Gviz",
+                          "tidyverse",
+                          "useful",
+                          "gplots",
+                          "SummarizedExperiment",
+                          "BiocParallel",
+                          "ggrepel",
+                          "ggbeeswarm",
+                          "grid",
+                          "gridextra",
+                          "reshape2",
+                          "factoextra",
+                          "Hmisc",
+                          "GenomicRanges",
+                          "cowplot",
+                          "BSgenome.Hsapiens.UCSC.hg38",
+                          "tidyverse",
+                          "useful",
+                          "ggrepel",
+                          "factoextra",
+                          "Hmisc", 
+                          "Matrix",
+                          "RcisTarget",
+                          "GSVA",
+                          "BRGenomics",
+                          "ATACseqQC")
+new.packages.bioc <- list.of.bioc.packages[!(list.of.bioc.packages %in% installed.packages()[,"Package"])]
+ 
+if(length(new.packages.bioc)>0)if (!requireNamespace("BiocManager")) install.packages("BiocManager")
+BiocManager::install(new.packages.bioc, update = FALSE)
+```
+
+### Load packages
+
+```{r, message=FALSE}
+#install.packages("arrow", ARROW_WITH_ZSTD=ON)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(chromVAR)
+library(tidyverse) #
+library(useful) #
+library(gplots)
+library(SummarizedExperiment)
+library(BiocParallel)
+library(ggrepel) #
+library(grid)
+library(gridExtra)
+library(reshape2)
+library(factoextra) #
+library(Hmisc) #
+library(GenomicRanges)
+library(GenomicAlignments)
+library(rtracklayer)
+library(Rsamtools)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(biomaRt)
+library(org.Mm.eg.db) 
+library(org.Hs.eg.db) 
+library(DESeq2)
+library(tximport)
+library(vsn)
+library(IHW)
+library(rhdf5)
+library(genefilter)
+library(fdrtool)
+library(RColorBrewer)
+library(pheatmap)
+library(cowplot) 
+library(Gviz)
+library(GSEABase)
+library(clusterProfiler)
+library(DOSE)
+library(sva)
+library(limma)
+library(motifmatchr)
+library(Matrix) #
+library(RcisTarget) #
+library(arrow) #
+library(fgsea) #
+library(ATACseqQC)
+library(BRGenomics)
+```
+
+# ATAC-seq analysis
+
+## Functions
+
+### Peak import
+
+```{r}
+# Importing of BED files and production of GRanges object of all peaks
+# Modified to support multiple files exclusion
+importBEDpeaks <- function(pattern = NULL, 
+                           path = NULL,
+                           exclude = NULL){
+  fileNames <- dir(path, pattern = pattern)
+  if(!is.null(exclude)){
+    for (i in exclude){
+  fileNames <- fileNames[!grepl(i, fileNames)] 
+  }
+  }
+  bedPeaks <- GRangesList()
+  for (i in fileNames) {
+    tmp <- read.table(paste(path,i,sep="/"))
+    bedPeaks[[i]] <- GRanges(seqnames = Rle(tmp$V1), ranges = IRanges(start = tmp$V2, end = tmp$V3), strand = Rle("*"))
+    bedPeaks[[i]] <- bedPeaks[[i]][grepl("chr",bedPeaks[[i]]@seqnames),]
+  }
+  if (!is.null(pattern)) names(bedPeaks) <- sub(pattern, "", names(bedPeaks), fixed = TRUE)
+  return(bedPeaks)
+}
+```
+
+### Peak unification
+
+```{r}
+# Produce union of all peaks for counting of the reads
+unionPeaks <- function(peaks) {
+  upks <- GenomicRanges::reduce(unlist(peaks))
+  for (i in names(peaks)) {
+    mcols(upks)[, i] <- countOverlaps(subject = peaks[[i]],
+                                      query = upks) != 0
+  }
+  names(upks) <- paste(seqnames(upks), start(upks), end(upks), sep="_")
+  return(upks)
+}
+```
+
+### Count table
+
+```{r}
+# Prepare count table for all peaks
+peakCountTable <- function(peaks, path = NULL, pattern = NULL,
+                           exclude = NULL) {
+  fileNames <- dir(path, pattern = pattern)
+  if(!is.null(exclude)){
+    for (i in exclude){
+  fileNames <- fileNames[!grepl(i, fileNames)] 
+  }
+  }
+  bamFiles <- BamFileList(paste(path,fileNames,sep="/"), asMates = TRUE)
+  countTable <- summarizeOverlaps(features = peaks,
+                                  reads = bamFiles,
+                                  mode = "Union",
+                                  singleEnd = FALSE,
+                                  fragments =FALSE,
+                                  ignore.strand = TRUE)
+  if (!is.null(pattern)) colnames(countTable) <- sub(pattern, "", colnames(countTable))
+  return(countTable)
+}
+```
+
+### PCA
+
+```{r}
+plotPCA <- function(pca_input = dds_vst,
+                    ntop="all", 
+                    xPC=1, 
+                    yPC=2,
+                    point_size=3,
+                    title="",
+                    color,
+                    #shape,
+                    anno_color="NULL"){
+  
+  vst_matrix <- as.matrix(assay(pca_input))
+  
+  if(ntop=="all"){
+    pca <- prcomp(t(vst_matrix)) 
+  }else{
+    # select the ntop genes by variance
+    select <- order(rowVars(vst_matrix), decreasing=TRUE)[c(1:ntop)]
+    pca <- prcomp(t(vst_matrix[select,]))
+  }
+  
+  #calculate explained variance per PC
+  explVar <- pca$sdev^2/sum(pca$sdev^2)
+  # transform variance to percent
+  percentVar <- round(100 * explVar[c(xPC,yPC)], digits=1)
+  
+  # Define data for plotting  
+  pcaData <- data.frame(xPC=pca$x[,xPC], 
+                        yPC=pca$x[,yPC], 
+                        color = sample_table[[color]],
+                        #shape = sample_table[[shape]],
+                        name= as.character(sample_table$sample),
+                        stringsAsFactors = F)
+  
+  #plot PCA
+  pca_plot <- ggplot(pcaData, aes(x = xPC, y = yPC, fill=color)) +
+    geom_point(size =point_size, shape=21, color="black") + theme_bw()+
+      xlab(paste0("PC ",xPC, ": ", percentVar[1], "% variance")) +
+    ylab(paste0("PC ",yPC,": ", percentVar[2], "% variance"))
+  
+  if(anno_color[1] == "NULL"){
+    pca_plot <- pca_plot + scale_color_discrete(name=color)
+  }else{
+    pca_plot <- pca_plot + scale_fill_manual(values=anno_color)
+  }
+  
+  #pca_plot <- pca_plot + 
+    #geom_text_repel(aes(label = name), colour = "black")+
+    #xlab(paste0("PC ",xPC, ": ", percentVar[1], "% variance")) +
+    #ylab(paste0("PC ",yPC,": ", percentVar[2], "% variance")) +
+    #coord_fixed()+
+    #theme_classic()+        
+    #theme(aspect.ratio = 1)+ 
+    #ggtitle(title)
+  
+  pca_plot
+}
+```
+
+### DESeq2 output
+
+```{r}
+# Specify structure of DESeq2_analysis_object
+
+setClass(Class = "DESeq2_analysis_object",
+         slots = c(results="data.frame", DE_genes="list", Number_DE_genes="list"))
+
+
+# Wrapper Function to perform DESeq2 differential testing
+DEAnalysis <- function(condition,
+                       alpha = 0.05, 
+                       lfcThreshold = 0,
+                       sigFC = 2, 
+                       multiple_testing = "IHW",
+                       independentFiltering="TRUE",
+                       shrinkage = TRUE,
+                       shrinkType = "normal"){
+  # create results_list  
+  results_list <- list()
+  # print parameters
+  results_list$parameters <-list(multiple_testing = multiple_testing,
+                                 p_value_threshold = alpha,
+                                 log2_FC_threshold = lfcThreshold,
+                                 shrinkage = shrinkage,
+                                 shrinkage_type = shrinkType)
+  # Run results() function on comparisons defined in comparison table
+  for (i in 1:nrow(comparison_table)){
+    # create DE_object
+    DE_object <- new(Class = "DESeq2_analysis_object")
+    # IHW
+    if (multiple_testing=="IHW") {
+      res_deseq_lfc <- results(dds,
+                               contrast = c(condition,
+                                            paste(comparison_table$comparison[i]),
+                                            paste(comparison_table$control[i])),
+                               lfcThreshold = lfcThreshold,
+                               alpha = alpha,
+                               filterFun = ihw,
+                               altHypothesis = "greaterAbs")
+      # Independent Filtering
+    }else {
+      res_deseq_lfc <- results(dds,
+                               contrast = c(condition,
+                                            paste(comparison_table$comparison[i]),
+                                            paste(comparison_table$control[i])),
+                               lfcThreshold = lfcThreshold,
+                               alpha = alpha,
+                               independentFiltering = independentFiltering,
+                               altHypothesis = "greaterAbs",
+                               pAdjustMethod= multiple_testing)
+    }
+    if(shrinkage == TRUE){
+      res_deseq_lfc <- lfcShrink(dds, 
+                                 contrast = c(condition,
+                                              paste(comparison_table$comparison[i]),
+                                              paste(comparison_table$control[i])),
+                                 res=res_deseq_lfc,
+                                 type = shrinkType)
+    }
+    res_deseq_lfc <- as.data.frame(res_deseq_lfc)
+    # indicate significant DE genes  
+    res_deseq_lfc$regulation <- ifelse(!is.na(res_deseq_lfc$padj)&
+                                         res_deseq_lfc$padj <= alpha&
+                                         res_deseq_lfc$log2FoldChange > log(sigFC,2),
+                                       "up",
+                                       ifelse(!is.na(res_deseq_lfc$padj)&
+                                                res_deseq_lfc$padj <= alpha&
+                                                res_deseq_lfc$log2FoldChange < -log(sigFC,2),
+                                              "down",
+                                              "n.s."))
+    # add gene annotation to results table
+    res_deseq_lfc$peakid <- row.names(res_deseq_lfc) # ensembl-IDs as row names
+    res_deseq_lfc <- merge(res_deseq_lfc, 
+                           norm_anno[,c("peakid", 
+                                        "symbol", 
+                                        "type",
+                                        "description",
+                                        "geneChr",
+                                        "geneStart",
+                                        "geneEnd",
+                                        "geneLength",
+                                        "geneStrand",
+                                        "geneId",
+                                        "distanceToTSS",
+                                        "start",
+                                        "end",
+                                        "annotation")], 
+                           by = "peakid") 
+    row.names(res_deseq_lfc) <- res_deseq_lfc$peakid
+    res_deseq_lfc$comparison<-paste(comparison_table$comparison[i]," vs ",comparison_table$control[i],
+                                    sep="")
+    # re-order results table
+    if (multiple_testing=="IHW") {
+      res_deseq_lfc<-res_deseq_lfc[,c("peakid", 
+                                        "symbol",
+                                      "geneId",
+                                        "type",
+                                        "description",
+                                        "geneChr",
+                                     "comparison",
+                                     "regulation",
+                                     "baseMean",
+                                     "log2FoldChange",
+                                     "lfcSE",
+                                     "stat",
+                                     "pvalue",
+                                     "padj",
+                                     "weight",
+                                     "annotation")]
+    }else{
+      res_deseq_lfc<-res_deseq_lfc[,c("peakid", 
+                                        "symbol",
+                                      "geneId",
+                                        "type",
+                                        "description",
+                                        "geneChr",
+                                      "comparison",
+                                      "regulation",
+                                      "baseMean",
+                                      "log2FoldChange",
+                                      "lfcSE",
+                                      "stat",
+                                      "pvalue",
+                                      "padj",
+                                      "annotation")]
+    }
+    # print result table
+    DE_object@results <- res_deseq_lfc
+    # print DE genes in seperate tables
+    DE_object@DE_genes <- list(up_regulated_Genes = res_deseq_lfc[res_deseq_lfc$regulation =="up",],
+                               down_regulated_Genes= res_deseq_lfc[res_deseq_lfc$regulation =="down",])
+    # print the numbers of DE genes
+    DE_object@Number_DE_genes <- list(up_regulated_Genes = nrow(DE_object@DE_genes$up_regulated_Genes),
+                                      down_regulated_Genes= nrow(DE_object@DE_genes$down_regulated_Genes))
+    # write DE_object into results_list
+    results_list[[paste(comparison_table$comparison[i], "vs", comparison_table$control[i], sep="_")]] <- DE_object
+  }
+  return(results_list)
+}
+```
+
+## Directories
+
+```{r}
+projectPath <- "/home/caterina/data/alignment/2022-03-16/"
+bamFilePath <- paste(projectPath,"output/mapped", sep = "")
+bedFilePath <- paste(projectPath, "output/peaks", sep = "")
+
+analysisPath <- "/home/caterina/data/analysis/"
+```
+
+## Load MisigDB gene sets
+
+```{r}
+hallmark_genes <- clusterProfiler::read.gmt("/home/caterina/data/analysis/GMTfiles/h.all.v6.2.entrez.gmt")
+cannonicalPathway_genes <- clusterProfiler::read.gmt("/home/caterina/data/analysis/GMTfiles/c2.cp.v6.2.entrez.gmt")
+immuno_genes <- clusterProfiler::read.gmt("/home/caterina/data/analysis/GMTfiles/c7.all.v6.2.entrez.gmt")
+motifs <- clusterProfiler::read.gmt("/home/caterina/data/analysis/GMTfiles/c3.all.v6.2.entrez.gmt")
+```
+
+## Sample Annotation 
+
+```{r}
+sample_table_all <- read.csv("sample_table_ATACseq.csv",sep=";",header=TRUE, stringsAsFactors = TRUE)
+sample_table_all <- sample_table_all[1:39,]
+sample_table <- subset(sample_table_all, sample_table_all$Position %in% c("L1", "L6"))
+
+sample_table$sample <- paste("Sample_",sample_table$ID,sep="")
+rownames(sample_table) <- sample_table$sample
+
+sample_table$Position <- factor(sample_table$Position, levels=c("L1", "L6"))
+
+sample_table$Patient <- factor(sample_table$Patient, levels=c("583", "588", "640", "689"))
+```
+
+## Data Import, QC and Processing
+
+### TSS enrichment score
+
+```{r}
+set.seed(1)
+
+txs <- transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene)
+TSS_df <- list()
+
+for(i in sample_table$sample){
+  
+  message(dir(path=bamFilePath, pattern = paste0(i, ".final.bam$")))
+  sortedBAM <- dir(path=bamFilePath, paste0(i, ".final.bam$"),full.names = TRUE)
+  #sample <- paste(strsplit(dir(path=bamFilePath, pattern = ".final.bam$")[i],"\\.")[[1]][1],sep="")
+  
+  bam <- import_bam(sortedBAM,
+                  mapq = 20, #Filter reads by a minimum MAPQ score. This is the correct way to filter multi-aligners.
+                  revcomp = FALSE, #Logical indicating if aligned reads should be reverse-complemented.
+                  shift = 0L,
+                  trim.to = c("whole", "5p", "3p", "center"), #Option for selecting specific bases from the reads, applied after the revcomp and shift options. By default, the entire read is maintained.
+                  ignore.strand = FALSE, #Logical indicating if the strand information should be discarded.
+                  field = "score", #Metadata field name to use for readcounts, usually "score". If set to NULL, identical reads (or identical positions if trim.to options applied) are not combined, and the length of the output GRanges will be equal to the number of input reads.
+                  paired_end = TRUE)
+
+  bam_gal <- as(bam, "GAlignments")
+
+  tsse <- TSSEscore(bam_gal, txs)
+  
+  TSS_df[[paste0(i)]] <- tsse$TSSEscore
+  
+}
+```
+
+### Insert size
+
+```{r,fig.height=24,fig.width=12}
+plotList_2 <- list()
+
+for(i in 1:length(sample_table_all$ID)){
+  message(dir(path=bamFilePath, pattern = ".final.bam$")[i])
+  sortedBAM <- dir(path=bamFilePath, pattern = ".final.bam$",full.names = TRUE)[i]
+  sample <- paste(strsplit(dir(path=bamFilePath, pattern = ".final.bam$")[i],"\\.")[[1]][1],sep="")
+  
+  atacReads <- readGAlignmentPairs(sortedBAM, 
+                                   param = ScanBamParam(mapqFilter = 1,
+                                                        flag = scanBamFlag(isPaired = TRUE, isProperPair = TRUE), 
+                                                        what = c("qname", 
+                                                                 "mapq", 
+                                                                 "isize")))
+  
+  atacReads_read1 <- GenomicAlignments::first(atacReads)
+  insertSizes <- abs(elementMetadata(atacReads_read1)$isize)
+  
+  inserts <- table(insertSizes) %>% 
+    data.frame %>% 
+    mutate(insertSizes = as.numeric(as.vector(insertSizes)),
+           Freq = as.numeric(as.vector(Freq)))
+  
+  plotList_2[[i]] <- ggplot(inserts, aes(x = insertSizes, y = Freq)) + 
+    geom_line()+ 
+    geom_vline(xintercept = c(180, 247), colour = "red") + 
+    geom_vline(xintercept = c(315, 437), colour = "darkblue") + 
+    geom_vline(xintercept = c(100), colour = "darkgreen") + 
+    ggtitle(sample)+
+    theme_bw()
+}
+
+plot_grid(plotlist = plotList_2,ncol=2)
+```
+
+#### Overlayed FSD
+
+```{r, fig.width=5, fig.height=4}
+inserts_ol <- list()
+
+for(i in 1:length(plotList_2)){
+  
+  m <- plotList_2[[i]][["data"]]
+  q <- plotList_2[[i]][["labels"]][["title"]]
+  inserts_ol[[paste0(q)]] <- m
+  
+}
+
+inserts_df <- data.frame()
+
+for(i in names(inserts_ol)){
+  
+  n <- inserts_ol[[i]]
+  n$df <- paste0(i)
+  
+  inserts_df <- rbind(inserts_df, n)
+  
+}
+
+insert_subset <- subset(inserts_df, inserts_df$df %in% c("Sample_17539", "Sample_17540", "Sample_17512", "Sample_17513", "Sample_17522", "Sample_17523", "Sample_17510", "Sample_17511", "Sample_17531", "Sample_17532","Sample_17502","Sample_17503", "Sample_17520", "Sample_17521", "Sample_17529","Sample_17530"))
+
+fsd_n <-ggplot(insert_subset, aes(x = insertSizes, y = Freq)) + 
+  geom_line(aes(color = df)) +
+  xlim(0, 800) +
+  ylim(0, 300000) +
+  labs(x="Fragment size (bp)", y="Fragments number") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black", size = 10), axis.text.y = element_text(colour = "black", size = 10)) +
+  theme(aspect.ratio = 1)
+
+insert_subset <- insert_subset %>% group_by(df) %>% mutate(sum = sum(Freq))
+insert_subset$ratio <- ((insert_subset$Freq)*100)/(insert_subset$sum)
+
+fsd_ratio <- ggplot(insert_subset, aes(x = insertSizes, y = ratio)) + 
+  geom_line(aes(color = df)) +
+  xlim(0, 800) +
+  ylim(0, 2.5) +
+  labs(x="Fragment size (bp)", y="Fragments %") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black", size = 10), axis.text.y = element_text(colour = "black", size = 10)) +
+  theme(aspect.ratio = 1)
+
+fsd_n
+fsd_ratio
+```
+
+#### FSD groupwise
+
+```{r}
+anno_pos <- sample_table[, c(4,5,8)]
+colnames(anno_pos)[3] <- "df"
+insert_subset_L <- merge(insert_subset, anno_pos, by = "df")
+insert_subset_L1 <- subset(insert_subset_L, insert_subset_L$Position == "L1")
+insert_subset_L6 <- subset(insert_subset_L, insert_subset_L$Position == "L6")
+
+fsd_L1 <- ggplot(insert_subset_L1, aes(x = insertSizes, y = ratio)) + 
+  geom_line(aes(color = df)) +
+  xlim(0, 800) +
+  ylim(0, 2.5) +
+  labs(x="Fragment size (bp)", y="Fragments %") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black", size = 10), axis.text.y = element_text(colour = "black", size = 10)) +
+  theme(aspect.ratio = 1) +
+  ggtitle("L1")
+
+fsd_L6 <- ggplot(insert_subset_L6, aes(x = insertSizes, y = ratio)) + 
+  geom_line(aes(color = df)) +
+  xlim(0, 800) +
+  ylim(0, 2.5) +
+  labs(x="Fragment size (bp)", y="Fragments %") +
+  theme_classic() +
+  theme(axis.text.x = element_text(colour = "black", size = 10), axis.text.y = element_text(colour = "black", size = 10)) +
+  theme(aspect.ratio = 1) +
+  ggtitle("L6")
+
+grid.arrange(fsd_L1, fsd_L6, ncol=2)
+```
+
+### Import merged bam-called peaks
+
+Peaks are here called on bed derived from merging all bam files. 
+
+```{r}
+tmp <- read.table("/home/caterina/data/analysis/lorenzo/all_l1_l6/output/peaks/merged_selected_peaks.narrowPeak")
+peakSummary <- GRanges(seqnames = Rle(tmp$V1), ranges = IRanges(start = tmp$V2, end = tmp$V3), strand = Rle("*"))
+peakSummary <- peakSummary[grepl("chr",peakSummary@seqnames),]
+names(peakSummary) <- paste(seqnames(peakSummary), start(peakSummary), end(peakSummary), sep="_")
+
+blacklistedRegions <- import.bed(paste(analysisPath,"hg38-blacklist.v2.bed.gz",sep="/"))  
+PeaksBlacklisted <- countOverlaps(subject = blacklistedRegions,
+                                  query = peakSummary) != 0
+
+table(PeaksBlacklisted)
+
+peakSummary <- peakSummary[!PeaksBlacklisted]
+```
+
+```{r}
+# define gaps between peaks
+gapSummary <- gaps(peakSummary)
+GapsBlacklisted <- countOverlaps(subject = blacklistedRegions,
+                                 query = gapSummary) != 0
+table(GapsBlacklisted)
+gapSummary <- gapSummary[!GapsBlacklisted]
+```
+
+```{r}
+### Dataframe of peakPresence
+peakSummary.df <- as.data.frame(peakSummary@elementMetadata)
+rownames(peakSummary.df)<- peakSummary@ranges@NAMES
+colnames(peakSummary.df)<- unlist(lapply(strsplit(colnames(peakSummary.df),split ="_peaks"), function(x) x[[1]]))
+```
+
+###### Histogram on peak width
+
+```{r, warning=FALSE}
+ggplot(data.frame(peakSummary@ranges), aes(width)) + 
+  geom_histogram(aes(y=..count..),binwidth = 10,fill="#A9DDD9")+
+  scale_x_continuous(limits=c(100,400))+
+  geom_text(aes(900, 200, label = paste(sum(data.frame(peakSummary@ranges)$width>1000),">",sep=""), 
+                vjust = -0.5), col = "black")+
+  theme_classic()
+```
+
+### Import Counts
+
+```{r,warning=FALSE}
+# count reads from bam files in peak regions
+countsPerPeak <- peakCountTable(peaks = peakSummary, 
+                                   path = bamFilePath, 
+                                   pattern = ".final.bam$",
+                                   exclude = c("Sample_17504", "Sample_17505", "Sample_17506", "Sample_17507", "Sample_17508", "Sample_17509", "Sample_17514", "Sample_17515", "Sample_17516", "Sample_17517","Sample_17518","Sample_17519", "Sample_17524", "Sample_17525", "Sample_17526","Sample_17527", "Sample_17528","Sample_17533", "Sample_17534","Sample_17535", "Sample_17536","Sample_17537", "Sample_17538"))
+                                
+#write peak counts into data frame
+countsPerPeak.df <- as.data.frame(assay(countsPerPeak))
+```
+
+```{r,warning=FALSE}
+# count reads from bam files in gap regions
+countsPerGap <- peakCountTable(peaks = gapSummary, 
+                               path = bamFilePath, 
+                               pattern = ".final.bam$",
+                               exclude = c("Sample_17504", "Sample_17505", "Sample_17506", "Sample_17507", "Sample_17508", "Sample_17509", "Sample_17514", "Sample_17515", "Sample_17516", "Sample_17517","Sample_17518","Sample_17519", "Sample_17524", "Sample_17525", "Sample_17526","Sample_17527", "Sample_17528","Sample_17533", "Sample_17534","Sample_17535", "Sample_17536","Sample_17537", "Sample_17538"))
+
+#write gap counts into data frame
+countsPerGap.df <- as.data.frame(assay(countsPerGap))
+```
+
+##### QC 
+
+```{r}
+# Count Statistics
+totalPeakLength <- sum(as.numeric(width(peakSummary)))
+totalPeakNumber <- length(peakSummary)
+meanPeakLength <- round(totalPeakLength/totalPeakNumber,3)
+totalPeakReads <- colSums(countsPerPeak.df)
+meanReadsperPeak <- round(totalPeakReads/totalPeakNumber,3)
+PeakReadsperBase <- totalPeakReads/totalPeakLength
+
+# Gap statistics
+totalGapLength <- sum(as.numeric(width(gapSummary)))
+totalGapNumber <- length(gapSummary)
+meanGapLength <- round(totalGapLength/totalGapNumber,3)
+totalGapReads <- colSums(assay(countsPerGap))
+meanReadsperGap <- round(totalGapReads/totalGapNumber,3)
+GapReadsperBase <- totalGapReads/totalGapLength
+
+summary.stats <- data.frame("totalPeakLength"=totalPeakLength,
+                           "totalGapLength"=totalGapLength,
+                            "totalPeakNumber"=totalPeakNumber,
+                            "totalReads" = totalPeakReads+totalGapReads,
+                            "totalPeakReads" = totalPeakReads,
+                            "totalGapReads" = totalGapReads,
+                            "meanReadsperPeak"= meanReadsperPeak,
+                            "meanReadsperGap" = meanReadsperGap,
+                            "PeakReadsperBase"=round(PeakReadsperBase,3),
+                            "GapReadsperBase"= round(GapReadsperBase,3),
+                            #"CoverageRatio" = round(PeakReadsperBase/GapReadsperBase,3))
+                           "FRiP_score" = round(totalPeakReads/(totalPeakReads+totalGapReads),3))
+
+idx <- match(rownames(summary.stats), sample_table$sample)
+summary.stats$time <- sample_table$Time[idx]
+summary.stats$group <- sample_table$Group[idx]
+summary.stats$celltype <- sample_table$Celltype[idx]
+
+summary.stats
+```
+
+```{r,fig.width=24,fig.height=6}
+tmp <- melt(countsPerPeak.df)
+idx <- match(tmp$variable,sample_table$ID)
+tmp$ID <- sample_table$ID[idx]
+
+p1 <- ggplot(tmp, aes(x= variable, y= value+1, fill= ID))+
+  geom_boxplot() +
+  scale_y_log10()+
+  ylab("log10(Count+1)")+
+  xlab("") +
+  theme_classic()+
+  theme(axis.text.x = element_text(size=8, angle = 45, hjust = 1),
+        plot.title = element_text(size = 8, face = "bold"))
+
+p2 <- ggplot(summary.stats, aes(x= rownames(summary.stats), y= totalPeakReads,
+                                fill=rownames(summary.stats)))+
+  geom_boxplot() +
+  geom_jitter(aes(shape=rownames(summary.stats))) +
+  ylab("Total Peak Counts")+
+  xlab("") +
+  theme_classic()+
+  theme(axis.text.x = element_text(size=8, angle = 45, hjust = 1),
+        plot.title = element_text(size = 8, face = "bold"))
+
+# visualize the FRiP score
+p3 <- ggplot(summary.stats, aes(x = rownames(summary.stats), y = FRiP_score, fill=rownames(summary.stats))) +
+  geom_boxplot() +
+  geom_jitter(aes(shape=rownames(summary.stats))) +
+  ylab("Reads in Peaks/Reads in Gaps")+
+  xlab("") +
+  theme_classic()+
+  theme(axis.text.x = element_text(size=8, angle = 45, hjust = 1),
+        plot.title = element_text(size = 8, face = "bold"))
+
+plot_grid(p1, p2, p3, ncol=2, rel_widths = c(2.3,1))
+```
+
+#### QC board
+
+```{r, fig.width=14, fig.height=4.5}
+# format TSS-ES
+TSS_persample <- t(as.data.frame(TSS_df))
+colnames(TSS_persample)[1] <- "TSS_ES"
+TSS_persample <- as.data.frame(TSS_persample)
+TSS_persample$ID <- rownames(TSS_persample)
+reduced_st <- sample_table[, c(2, 8)]
+colnames(reduced_st)[2] <- "ID"
+TSS_persample <- merge(reduced_st, TSS_persample, by="ID")
+
+# format FRiP score and log10(unique_reads)
+FRiP_UR <- summary.stats[, c(4,11)]
+FRiP_UR$log10UR <- log10(FRiP_UR$totalReads)
+FRiP_UR$ID <- rownames(FRiP_UR)
+FRiP_UR <- merge(reduced_st, FRiP_UR, by="ID")
+
+# format mito%
+mito_perc <- read.csv("/home/caterina/data/analysis/lorenzo/mito_counts/mito_percent.csv", header = FALSE)
+mito_perc <- subset(mito_perc, mito_perc$V1 %in% sample_table$ID)
+colnames(mito_perc)[2] <- "mito%"
+mito_perc$ID <- paste0("Sample_", mito_perc$V1)
+mito_perc$V1 <- NULL
+mito_perc <- merge(reduced_st, mito_perc, by="ID")
+
+# plot board as one-col heatmap
+
+# TSS_ES
+my_breaks_TSS <- c(min(TSS_persample$TSS_ES), max(TSS_persample$TSS_ES))
+
+TSS_hm <- ggplot(TSS_persample, aes(1, Name, fill = TSS_ES)) +
+  geom_tile() +
+  scale_fill_gradientn(colours = c("#e5f9ec", "#008e2f"), breaks = my_breaks_TSS) +
+  geom_text(aes(label = round(TSS_ES, 2))) +
+  xlab("TSS_ES") +
+  ylab("") +
+  theme_bw(base_size = 13) +
+  theme(plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.text=element_text(size=8),
+    aspect.ratio = 5)
+
+# FRiP
+my_breaks_FRiP <- c(min(FRiP_UR$FRiP_score), max(FRiP_UR$FRiP_score))
+
+FRiP_hm <- ggplot(FRiP_UR, aes(1, Name, fill = FRiP_score)) +
+  geom_tile() +
+  scale_fill_gradientn(colours = c("#f6cef6", "#7e067e"), breaks = my_breaks_FRiP) +
+  geom_text(aes(label = round(FRiP_score, 2))) +
+  xlab("FRiP_score") +
+  ylab("") +
+  theme_bw(base_size = 13) +
+  theme(plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.text=element_text(size=8),
+    aspect.ratio = 5)
+
+# log10UR
+my_breaks_log10UR <- c(min(FRiP_UR$log10UR), max(FRiP_UR$log10UR))
+
+log10UR_hm <- ggplot(FRiP_UR, aes(1, Name, fill = log10UR)) +
+  geom_tile() +
+  scale_fill_gradientn(colours = c("#feefd8", "#e19e39"), breaks = my_breaks_log10UR) +
+  geom_text(aes(label = round(log10UR, 2))) +
+  xlab("log10UR") +
+  ylab("") +
+  theme_bw(base_size = 13) +
+  theme(plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.text=element_text(size=8),
+    aspect.ratio = 5)
+
+# mito%
+my_breaks_mito<- c(min(mito_perc$`mito%`), max(mito_perc$`mito%`))
+
+mito_perc_hm <- ggplot(mito_perc, aes(1, Name, fill = `mito%`)) +
+  geom_tile() +
+  scale_fill_gradientn(colours = c("#DE3E1C", "#f8d8d1"), breaks = my_breaks_mito) +
+  geom_text(aes(label = round(`mito%`, 2))) +
+  xlab("mito%") +
+  ylab("") +
+  theme_bw(base_size = 13) +
+  theme(plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.text=element_text(size=8),
+    aspect.ratio = 5)
+
+grid.arrange(TSS_hm, FRiP_hm, log10UR_hm, mito_perc_hm, ncol=4)
+```
+
+### Histogram of rowSums
+
+```{r,fig.height=4,fig.width=8, warning=FALSE}
+countStats <- data.frame(row.names=rownames(countsPerPeak.df),
+                         mean=rowMeans(countsPerPeak.df),
+                         sum=rowSums(countsPerPeak.df))
+
+p4 <-ggplot(countStats, aes(mean)) + 
+  geom_histogram(binwidth = 1, fill= "#A9DDD9")+
+  scale_x_continuous(limits=c(0,50))+
+  geom_text(aes(450, 1000, label = paste(sum(countStats$mean>500),">",sep=""), vjust = -0.5), col = "black")+
+  theme_classic()
+
+p5 <-ggplot(countStats, aes(sum)) + 
+  geom_histogram(binwidth = 10, fill= "#A9DDD9")+
+  scale_x_continuous(limits=c(0,200))+
+  geom_text(aes(4950, 200, label = paste(sum(countStats$sum>5000),">",sep=""), vjust = -0.5), col = "black")+
+  geom_vline(xintercept=10)+
+  theme_classic()
+
+plot_grid(p4, p5, labels=list("Mean","Sum"), 
+          label_x = 0.5, label_y = 0.9, hjust = -0.5, vjust = -0.5)
+```
+
+### Filter Peaks
+
+```{r}
+peaks2keep <- rownames(countsPerPeak.df[rowMax(as.matrix(countsPerPeak.df))>10,])
+length(peaks2keep)
+
+# filter peaks
+peakSummary.filt <- peakSummary[peaks2keep]
+peakSummary.filt.df <- peakSummary.df[rownames(peakSummary.df) %in% peaks2keep,]
+
+# filter counts
+countsPerPeak.filt.df <- countsPerPeak.df[peaks2keep,]
+```
+
+### Peak Annotation
+
+#### Genomic distribution
+
+```{r, fig.height=16,fig.width=8}
+peakSummary.filt$sum <- as.vector(rowSums(countsPerPeak.filt.df))
+covplot(peakSummary.filt, weightCol="sum",title = "ATAC peaks over Chromosomes")
+```
+
+### Relative localization to nearest gene
+
+```{r,warning=FALSE}
+# complete peak set
+peakAnnotation <- annotatePeak(peakSummary, TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene, level="gene")
+peakAnnotation.df <- as.data.frame(as.GRanges(peakAnnotation))
+
+# filtered peak set
+peakAnnotation.filt <- annotatePeak(peakSummary.filt, TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene, level="gene")
+peakAnnotation.filt.df <- as.data.frame(as.GRanges(peakAnnotation.filt))
+```
+
+##### PieChart
+
+```{r}
+plotAnnoPie(peakAnnotation.filt)
+```
+
+##### Histogram
+
+```{r, fig.width=5, fig.height=4, warning=FALSE}
+ggplot(data=peakAnnotation.filt.df, aes(x = peakAnnotation.filt.df$distanceToTSS)) + 
+  geom_histogram(aes(y=..count..), colour="black", fill="white", binwidth = 50) +
+  scale_x_continuous(limits=c(-2000,2000))+
+  scale_y_continuous(limits=c(0,2000), oob = scales::squish)+
+  labs(x="Distance to TSS (bp)", y="Peaks number")+
+  theme_classic()+
+  theme(axis.text.x = element_text(colour = "black", size = 10), axis.text.y = element_text(colour = "black", size = 10))
+```
+
+# Save image
+
+```{r}
+# save.image("/home/caterina/data/analysis/envs/141122.RData")
+```
+
+# DESeq2 analysis of peak counts
+
+#### DESeq2 object
+
+```{r}
+# produce DESeq data set
+dds <- DESeqDataSetFromMatrix(countData = countsPerPeak.filt.df,
+                              colData = sample_table,
+                              design = ~ 1) # change the design
+```
+
+#### Calculate DESeq2 Statistics
+
+```{r}
+dds <- DESeq(dds,quiet = FALSE)
+```
+
+#### Variance Stabilization
+
+```{r}
+dds_rlog <- rlog(dds, blind = FALSE)
+```
+
+# Annotated normalized count table
+
+```{r}
+#write table of normalized counts
+rlog_matrix <- as.matrix(assay(dds_rlog))
+norm <- subset(rlog_matrix, rownames(rlog_matrix) %in% rownames(peakAnnotation.filt.df))
+
+identical(rownames(norm), rownames(peakAnnotation.filt.df))
+
+norm_anno <- cbind(norm, peakAnnotation.filt.df)
+norm_anno$peakid <- rownames(norm_anno)
+```
+
+```{r}
+# add symbol annotation
+
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+getBM <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id"), bmHeader = T, mart = mart)
+colnames(getBM)[3] <- "geneId"
+colnames(getBM)[2] <- "symbol"
+colnames(getBM)[1] <- "ensId"
+
+#check out here
+
+getBM_overlap <- subset(getBM, getBM$geneId %in% norm_anno$geneId)
+getBM_overlap <- getBM_overlap[,c(2,3)]
+getBM_overlap <- unique(getBM_overlap)
+getBM_overlap <- getBM_overlap[!duplicated(getBM_overlap$geneId),]
+norm_anno_symbol <- subset(norm_anno, norm_anno$geneId %in% getBM_overlap$geneId)
+norm_anno_symbol <- merge(norm_anno_symbol, getBM_overlap, by = "geneId")
+```
+
+# Save image
+
+```{r}
+# save.image("/home/caterina/data/analysis/envs/080223.RData")
+```
+
+# Genome browser tracks
+
+```{r, fig.height=3, fig.width=7}
+# # CD68
+afrom <- 7567638
+ato <- 7594111
+# # chr 17
+
+# # SPI1 (PU.1)
+# afrom <- 47340000
+# ato <- 47420000
+# # chr 11
+
+# # SFTPB
+# afrom <- 85623154
+# ato <- 85702893
+# # chr 2
+
+gtrack <- GenomeAxisTrack()
+
+# Change chromosome n
+
+rtrack <- BiomartGeneRegionTrack(genome = "hg38", chromosome = "chr17",
+                              start = afrom, end = ato,
+                              filter = list(with_refseq_mrna = TRUE),
+                              stacking = "pack")
+
+
+bw_lung_encode <- "/home/caterina/data/analysis/encode_references/ENCSR647AOY_whole-lung/ENCFF210HIS.bigWig"
+
+bwtrack_encode <- DataTrack(bw_lung_encode, isPaired = T, name = "encode", type  = 'hist', fill = "grey")
+
+# Merged bw
+
+bw_all <- "/home/caterina/data/analysis/lorenzo/all_l1_l6/merged_selected.final.bw"
+
+bwtrack_all <- DataTrack(bw_all, isPaired = T, name = "aggregate_all", type  = 'hist', fill = "red", col.histogram = "NA")
+
+# Change chromosome n
+
+plotTracks(c(bwtrack_encode, bwtrack_all, gtrack), from = afrom, to = ato, type = "hist", window = -1, chromosome = "chr17", transcriptAnnotation = "symbol", sizes=c(1,1,1), legend = FALSE, col.title = "black", col.axis = "black", cex.axis = 0.5)
+```
+
+# Calculate median accessibility per gene
+
+```{r}
+# how to build up per gene accessibility? we compute the sum of normalized reads across peaks mapping on the same symbol as a proxy (no matter the peak annotation)
+
+norm_anno_motif <- norm_anno_symbol[, c(2:17, 32)]
+norm_anno_motif <- aggregate(.~symbol, data=norm_anno_motif, FUN=sum)
+norm_anno_motif <- norm_anno_motif[2:5284,]
+
+# calculate median accessibility per gene
+
+norm_anno_motif$median <- apply(norm_anno_motif, 1, median, na.rm=T)
+norm_anno_motif <- norm_anno_motif[order(norm_anno_motif$median, decreasing=TRUE), ]
+```
+
+# One-tailed FGSEA
+
+```{r, fig.height=5, fig.width=4}
+set.seed(1)
+
+FGSEA_input <- norm_anno_motif[,c(1,18)]
+rownames(FGSEA_input) <- FGSEA_input$symbol
+FGSEA_input$symbol <- NULL
+
+pathways.GO <- gmtPathways("/home/caterina/data/analysis/GMTfiles/c5.all.v2022.1.Hs.symbols.gmt")
+pathways.TF <- gmtPathways("/home/caterina/data/analysis/GMTfiles/c3.tft.v2022.1.Hs.symbols.gmt")
+
+RankedVect <- as.numeric(FGSEA_input$median)
+names(RankedVect) <- rownames(FGSEA_input)
+
+fgsea_GO <- fgsea(pathways=pathways.GO, RankedVect, scoreType = "pos")
+fgsea_TF <- fgsea(pathways=pathways.TF, RankedVect, scoreType = "pos")
+
+plotGO <- plotEnrichment(pathways.GO[["GOBP_POSITIVE_REGULATION_OF_MYELOID_CELL_DIFFERENTIATION"]], RankedVect)+
+  ggtitle(paste("MYELOID_CELL_DIFFERENTIATION")) 
+
+plotTF <- plotEnrichment(pathways.TF[["PU1_Q6"]], RankedVect)+
+  ggtitle(paste("PU1_Q6"))
+
+grid.arrange(plotGO, plotTF)
+```
+
+# Session info
+
+```{r}
+sessioninfo <- sessionInfo()
+```
+
+
+
+
+
